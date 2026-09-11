@@ -34,7 +34,17 @@ DECLARE_UNREALSHARP_BINDER(Bind_UObject)
 	void InvokeNativeFunctionOutParms(UObject* NativeObject, UFunction* NativeFunction, uint8* Params, uint8* ReturnValueAddress)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(InvokeNativeFunctionOutParms);
-		
+
+		// 托管侧的包装器可能在程序集卸载后被清零（UnrealSharpObject::Dispose 把 NativeObject 置为 0），
+		// 而生成的绑定不做任何有效性检查。此处若不判空，会直接空指针解引用，
+		// 表现为 Fatal error 0xC0000005，且托管侧的 try/catch 无法捕获。
+		if (!NativeObject || !NativeFunction)
+		{
+			UE_LOGFMT(LogUnrealSharp, Error, "InvokeNativeFunctionOutParms called with a null {0}, ignoring the call.",
+				NativeObject ? TEXT("function") : TEXT("object"));
+			return;
+		}
+
 		if (!NativeFunction->HasAnyFunctionFlags(FUNC_Native) && NativeFunction->HasAnyFunctionFlags(FUNC_Event))
 		{
 			NativeObject->ProcessEvent(NativeFunction, Params);
@@ -69,6 +79,14 @@ DECLARE_UNREALSHARP_BINDER(Bind_UObject)
 
 	void EvaluateInvokePath(UObject* NativeObject, UFunction* NativeFunction, uint8* Params, uint8* ReturnValueAddress)
 	{
+		// 同上：所有调用路径的统一入口，先把无效调用挡下来。
+		if (!NativeObject || !NativeFunction)
+		{
+			UE_LOGFMT(LogUnrealSharp, Error, "EvaluateInvokePath called with a null {0}, ignoring the call.",
+				NativeObject ? TEXT("function") : TEXT("object"));
+			return;
+		}
+
 		const EFunctionFlags FunctionFlags = NativeFunction->FunctionFlags;
 
 		if (FunctionFlags & FUNC_HasOutParms)
@@ -97,6 +115,15 @@ DECLARE_UNREALSHARP_BINDER(Bind_UObject)
 	void InvokeNativeStaticFunction(UClass* NativeClass, UFunction* NativeFunction, uint8* Params, uint8* ReturnValueAddress)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(InvokeNativeStaticFunction);
+
+		// 调用原生类函数前就要取 CDO，所以这里也单独挡一次。
+		if (!NativeClass || !NativeFunction)
+		{
+			UE_LOGFMT(LogUnrealSharp, Error, "InvokeNativeStaticFunction called with a null {0}, ignoring the call.",
+				NativeClass ? TEXT("function") : TEXT("class"));
+			return;
+		}
+
 		UObject* ClassDefaultObject = NativeClass->GetDefaultObject();
 		EvaluateInvokePath(ClassDefaultObject, NativeFunction, Params, ReturnValueAddress);
 	}
@@ -104,7 +131,15 @@ DECLARE_UNREALSHARP_BINDER(Bind_UObject)
 	void InvokeNativeNetFunction(UObject* NativeObject, UFunction* NativeFunction, uint8* Params, uint8* ReturnValueAddress)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(InvokeNativeNetFunction);
-		
+
+		// 这里在进入 EvaluateInvokePath 之前就要访问 NativeObject，所以单独挡一次。
+		if (!NativeObject || !NativeFunction)
+		{
+			UE_LOGFMT(LogUnrealSharp, Error, "InvokeNativeNetFunction called with a null {0}, ignoring the call.",
+				NativeObject ? TEXT("function") : TEXT("object"));
+			return;
+		}
+
 		int32 FunctionCallspace = NativeObject->GetFunctionCallspace(NativeFunction, nullptr);
 
 		if (FunctionCallspace & FunctionCallspace::Remote)

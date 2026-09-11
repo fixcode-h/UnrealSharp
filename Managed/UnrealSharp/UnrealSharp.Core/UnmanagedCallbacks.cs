@@ -1,4 +1,6 @@
-﻿using System.Reflection;
+﻿using System.Collections.Concurrent;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using UnrealSharp.Core.Attributes;
 using UnrealSharp.Core.Marshallers;
@@ -154,9 +156,19 @@ public static class UnmanagedCallbacks
         }
     }
     
+    // 每个程序集只扫描一次，之后按原生类型名 O(1) 查表。
+    // 用 ConditionalWeakTable：键(Assembly)被回收时索引自动消失，不会把可回收 ALC 钉在内存里。
+    // （Assembly 之间按引用相等，热重载后是新实例，自然重建索引。）
+    private static readonly ConditionalWeakTable<Assembly, GeneratedTypeIndex> s_generatedTypeIndexes = new();
+
     [UnmanagedCallersOnly]
     public static unsafe IntPtr GetManagedTypeHandle(IntPtr assemblyHandle, char* fullTypeName)
     {
+        // 注意：本方法是 [UnmanagedCallersOnly]，异常一旦穿过原生边界，CLR 会直接终止进程
+        // （表现为 "Fatal error. Internal CLR error. (0x80131506)"）。所以这里必须兜住所有异常，
+        // 不能只 catch TypeLoadException。
+        IntPtr cachedHandle = IntPtr.Zero;
+
         try
         {
             string fullTypeNameString = new string(fullTypeName);
@@ -167,41 +179,80 @@ public static class UnmanagedCallbacks
                 throw new InvalidOperationException("The provided assembly handle does not point to a valid assembly.");
             }
 
-            return FindTypeInAssembly(loadedAssembly, fullTypeNameString);
-        }
-        catch (TypeLoadException ex)
-        {
-            LogUnrealSharpCore.LogError($"TypeLoadException while trying to look up managed type: {ex.Message}");
-            return IntPtr.Zero;
-        }
-    }
-    
-    private static IntPtr FindTypeInAssembly(Assembly assembly, string fullTypeName)
-    {
-        Type[] types = assembly.GetTypes();
-        foreach (Type type in types)
-        {
-            foreach (CustomAttributeData attributeData in type.CustomAttributes)
+            GeneratedTypeIndex index = s_generatedTypeIndexes.GetValue(loadedAssembly, static assembly => GeneratedTypeIndex.Build(assembly));
+
+            if (index.TryGetTypeHandle(fullTypeNameString, out cachedHandle))
             {
-                if (attributeData.AttributeType.FullName != typeof(GeneratedTypeAttribute).FullName)
-                {
-                    continue;
-                }
-
-                if (attributeData.ConstructorArguments.Count != 2)
-                {
-                    continue;
-                }
-
-                string fullName = (string)attributeData.ConstructorArguments[1].Value!;
-                if (fullName == fullTypeName)
-                {
-                    return GCHandle.ToIntPtr(GCHandleUtilities.AllocateStrongPointer(type, assembly));
-                }
+                return cachedHandle;
             }
         }
+        catch (Exception ex)
+        {
+            LogUnrealSharpCore.LogError($"Failed to resolve managed type handle for '{new string(fullTypeName)}': {ex}");
+            return IntPtr.Zero;
+        }
 
-        return IntPtr.Zero;
+        // 未找到时不缓存失败结果：否则热重载后可能一直命中失败，而每次调用又要重建一次索引。
+        return cachedHandle;
+    }
+
+    /// <summary>
+    /// 单个程序集内 "GeneratedType 的 FullName -> 托管类型句柄" 的一次性索引。
+    /// </summary>
+    private sealed class GeneratedTypeIndex
+    {
+        private readonly ConcurrentDictionary<string, IntPtr> _handlesByFullName = new(StringComparer.Ordinal);
+
+        public static GeneratedTypeIndex Build(Assembly assembly)
+        {
+            GeneratedTypeIndex index = new GeneratedTypeIndex();
+
+            // GetTypes() 在部分类型加载失败时会抛 ReflectionTypeLoadException；由调用方统一兜住。
+            foreach (Type type in assembly.GetTypes())
+            {
+                // 用 CustomAttributeData.GetCustomAttributes(type) 而不是 type.CustomAttributes：
+                // 前者不会实例化特性对象，开销显著更低（这里要对数万个类型各做一次）。
+                IList<CustomAttributeData> attributes = CustomAttributeData.GetCustomAttributes(type);
+
+                for (int i = 0; i < attributes.Count; i++)
+                {
+                    CustomAttributeData attributeData = attributes[i];
+
+                    // 与上游一致地按 FullName 比较，避免跨程序集上下文时 Type 身份不等价。
+                    if (attributeData.AttributeType.FullName != typeof(GeneratedTypeAttribute).FullName)
+                    {
+                        continue;
+                    }
+
+                    if (attributeData.ConstructorArguments.Count != 2)
+                    {
+                        continue;
+                    }
+
+                    if (attributeData.ConstructorArguments[1].Value is not string fullName)
+                    {
+                        continue;
+                    }
+
+                    // 原生侧 FCSFieldName::GetFullName() 查的就是 FullName（"{Namespace}.{EngineName}"，
+                    // 与 TypeDeclarationBuilder 生成 [GeneratedType(engineName, namespace.engineName)] 的第二参一致）。
+                    // 引擎名另外登记一份作为备用键，避免将来调用方改用 EngineName 时查不到。
+                    index._handlesByFullName.TryAdd(fullName, GCHandle.ToIntPtr(GCHandleUtilities.AllocateStrongPointer(type, assembly)));
+
+                    if (attributeData.ConstructorArguments[0].Value is string engineName && !string.IsNullOrEmpty(engineName))
+                    {
+                        index._handlesByFullName.TryAdd(engineName, GCHandle.ToIntPtr(GCHandleUtilities.AllocateStrongPointer(type, assembly)));
+                    }
+                }
+            }
+
+            return index;
+        }
+
+        public bool TryGetTypeHandle(string fullTypeName, out IntPtr handle)
+        {
+            return _handlesByFullName.TryGetValue(fullTypeName, out handle);
+        }
     }
     
     [UnmanagedCallersOnly]

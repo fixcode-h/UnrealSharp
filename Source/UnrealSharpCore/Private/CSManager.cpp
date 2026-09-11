@@ -86,12 +86,21 @@ void UCSManager::NotifyUObjectDeleted(const UObjectBase* Object, int32 Index)
 		return;
 	}
 
+	// 蓝图类、以及不属于任何托管程序集的类，FindOwningAssembly 会返回 nullptr；
+	// 直接解引用会在这条"对象已被删除"的回调路径上造成空指针崩溃。
 	UCSManagedAssembly* Assembly = FindOwningAssembly(Object->GetClass());
+	if (!IsValid(Assembly))
+	{
+		Handle->Dispose();
+		return;
+	}
+
 	TSharedPtr<const FGCHandle> AssemblyHandle = Assembly->GetAssemblyHandle();
-	
+
 #if WITH_EDITOR
 	if (!AssemblyHandle.IsValid())
 	{
+		Handle->Dispose();
 		return;
 	}
 #endif
